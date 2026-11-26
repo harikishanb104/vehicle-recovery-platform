@@ -1,0 +1,118 @@
+---
+description: Backend lesson walkthrough. Teach one story step, then wait for next. No new features.
+alwaysApply: true
+---
+
+# Backend lessons
+
+No new features. Teach lessons in order, one per turn. Cover the requirement, the files, what each function does, then one live test. Stop until the user says next.
+
+Debugger config `FastAPI: step through endpoints` is in `.vscode/launch.json`. Stop anything else on port 8000, press F5, and set a breakpoint on the function named in that lesson. F11 enters the next function. F10 stays on the current line. F5 continues. Swagger is at http://127.0.0.1:8000/docs.
+
+Story: a truck camera posts a scan, the scan is stored, and if that agency already has an active case for the VIN the sighting is attached. Otherwise mock eligibility runs. Eligible opens a `pending_claim` case with no owner. Not eligible keeps the scan and opens nothing. Any staff user can claim it. After the claim it is active and belongs to one tenant.
+
+Sample bodies:
+
+```json
+{"camera_id":"cam_1001","plate":"7XYZ123","vin":"1FTFW1E51NFA12345","latitude":33.749,"longitude":-84.388,"scanned_at":"2026-09-04T16:00:00Z","image_url":"https://example.com/scans/new.jpg"}
+```
+
+```json
+{"camera_id":"cam_2050","plate":"8ABC999","vin":"5NPE34AF9KH123456","latitude":33.75,"longitude":-84.39,"scanned_at":"2026-09-04T12:00:00Z","image_url":"https://example.com/scans/new.jpg"}
+```
+
+## Lesson 1 — How main.py starts, and the database health check
+
+Nothing about trucks. See how the process comes up and how we know Postgres is reachable.
+
+`backend/app/main.py`: the imports pull in the four routers and do not call them. `include_router` only registers them. `CORSMiddleware` lets the React app on port 5173 call this API. `GET /` is `root`. It names the service and does not touch the database. `GET /health` is `health`. It refuses to run if `DATABASE_URL` is missing, then calls `check_connection`.
+
+`backend/app/database.py` and `backend/app/config.py`: `load_env` reads `backend/.env` into the process. `get_engine` builds one SQLAlchemy engine for the whole process. A new engine on every health call would open a new connection pool each time. `check_connection` runs `SELECT 1`. That is the whole health test.
+
+Breakpoint: `health` in `main.py`, then F11 into `check_connection`.
+
+Test: http://127.0.0.1:8000/health. Expect `{"status":"ok","database":"connected"}`.
+
+## Lesson 2 — The truck scan, and what the payload is
+
+A truck drives past a parked car. The camera does not log in. It posts one JSON body. That body is the only information the platform gets.
+
+Fields: `camera_id` (which truck camera, for example `cam_1001`; this is how we later know the agency; no user and no tenant id in the body), `plate` (for example `7XYZ123`), `vin` (17-character vehicle id; cases match on this, not the plate), `latitude` and `longitude` (where the camera saw the car), `scanned_at` (must include a timezone, because the location trail sorts on this time), `image_url` (a link only; we do not upload the picture).
+
+`backend/app/schemas/scan.py` class `ScanDraft`. Each validator calls one rule in `backend/app/validation/fields.py`: `CameraId`, `Plate`, `Vin`, `ImageUrl`, then `GeoPoint` for the pair. A bad VIN or a latitude of 120 never reaches the database. FastAPI returns 422 before ingest runs.
+
+Do not follow the case branch. Learn the shape and what gets rejected.
+
+Breakpoint: `check_vin` on `ScanDraft`.
+
+Test in `/docs` on `POST /api/v1/scans`: send the `cam_1001` sample once so you see a success, then change `vin` to `IOQ` and see 422.
+
+## Lesson 3 — Eligibility
+
+After a scan is stored, the platform sometimes asks an outside lender network whether this vehicle is still supposed to be repossessed. The case study says not to build that network. This is the stand-in.
+
+`check_eligibility` in `backend/app/api/eligibility.py`. `still_eligible` in `backend/app/services/eligibility_service.py`. `backend/app/schemas/eligibility.py` checks the VIN shape before the service runs.
+
+Rule in `still_eligible`: a VIN ending in `0` means not eligible. VIN `00000000000000000` means the network did not answer, and the service raises `PartnerNetworkDown`. Every other VIN, including both sample VINs, is eligible.
+
+This route does not create a case and does not store a scan. The scan endpoint calls the same class directly in the next lesson. This route exists so we can see the rule by itself.
+
+Breakpoint: `still_eligible`.
+
+Test three bodies on `POST /mock/partner-network/eligibility`: `5NPE34AF9KH123456` returns true. `1FTFW1E51NFA12340` returns false. `00000000000000000` returns 503.
+
+## Lesson 4 — POST /api/v1/scans, both branches
+
+The payload from lesson 2 and the eligibility rule from lesson 3 meet.
+
+Store every accepted scan. Resolve the agency from `camera_id`, not from a login. If that agency already has an active case for the VIN, attach the sighting and stop. If not, call eligibility. Eligible opens a `pending_claim` case with no owner. Not eligible, or the network failing, keeps the scan and opens nothing. An unknown camera is rejected before any insert.
+
+`ingest_scan` in `backend/app/api/scans.py` only catches errors and returns JSON. The decisions are in `ScanIngestor.ingest` in `backend/app/services/scan_service.py`. Read that method in order: camera lookup, insert scan, active-case query, open-case query, `still_eligible`, then the savepoint that inserts the pending case.
+
+Seed context from `backend/seed.py`: Agency A owns `cam_1001` and an active case for `1FTFW1E51NFA12345`. Agency B owns `cam_2050` and has no case for `5NPE34AF9KH123456`.
+
+Breakpoint: `ingest`.
+
+Test 1, existing case: `cam_1001` and VIN `1FTFW1E51NFA12345`. Step until it returns `existing_case`. Eligibility is not called.
+
+Test 2, new case: `cam_2050` and VIN `5NPE34AF9KH123456`. Step into `still_eligible`, then watch the pending case get `tenant_id` left empty.
+
+## Lesson 5 — POST /api/v1/auth/login
+
+The camera path is done. A person now signs in. The case study allows a simple password, not a real identity provider. The tenant must come from the user row. The login body has no tenant id.
+
+`login` in `backend/app/api/auth.py`. `LoginService.authenticate` in `backend/app/services/auth_service.py`: find the user, check the hash, sign a JWT whose subject is the user id. `current_user` in `backend/app/api/deps.py`: later routes send that token, and this function loads the user so `tenant_id` is read from the database.
+
+Breakpoint: `authenticate`, then F11 into `verify_password`.
+
+Test: `agent.a` / `demo-pass` returns a token and a user with no `password_hash`. A wrong password returns 401. Press Authorize in `/docs` and paste the token.
+
+## Lesson 6 — GET /api/v1/cases
+
+The signed-in agency sees its own cases at every status, plus every `pending_claim` case from any agency. Another agency's active or closed cases never appear. `?status=` narrows that set.
+
+`list_cases` in `backend/app/api/cases.py` and `CaseService.list_cases` in `backend/app/services/case_service.py`. Read the `or_` filter: `tenant_id == caller` OR `status == pending_claim`.
+
+Breakpoint: `list_cases` on the service, and also `current_user` so you see the token become a tenant id.
+
+Test: as `agent.a`, the list includes the original active VIN and, after lesson 4, the pending VIN opened by Agency B's camera. `?status=active` drops the pending row.
+
+## Lesson 7 — POST /api/v1/cases/{case_id}/claim
+
+Any signed-in staff user may claim a pending case, even one opened by the other agency. After the claim it has exactly one tenant and one agent. An active or closed case is refused. Two people must not both win.
+
+`claim_case` in `backend/app/api/cases.py` and `CaseService.claim` in `backend/app/services/case_service.py`. The important line is `with_for_update()`: the database locks that row until this request finishes.
+
+Test: as `agent.a`, claim the pending id from lesson 4. Watch `status`, `tenant_id`, and `assigned_user_id` change together. Claim the same id as `agent.b`. Expect 409, "Case is already claimed or closed."
+
+## Lesson 8 — GET /api/v1/cases/{case_id}/scans
+
+The location trail is every stored scan for that VIN, oldest first, including sightings from before the case existed. The caller must be allowed to see the case. Another agency's active case returns 403 even if they know the id.
+
+`location_trail` in `backend/app/api/cases.py` and `CaseService.location_trail` plus `_visible_case` in `backend/app/services/case_service.py`. The query filters `Scan.vin`, not `Scan.case_id`, and orders by `scanned_at`.
+
+Test: as `agent.a`, open the original case and see the seeded sightings oldest first. As `agent.b`, open that same id and step through `_visible_case` until it raises `CaseHidden`. `backend/app/api/http.py` turns that into 403.
+
+## After lesson 8 — frontend, one screen at a time
+
+Only after the API lessons. `frontend/src/api/client.js` stores the token and sends `Authorization: Bearer`. `frontend/src/pages/Login.jsx` calls lesson 5. `frontend/src/pages/Cases.jsx` calls lessons 6 and 7. `frontend/src/pages/CaseDetails.jsx` calls lesson 8.
